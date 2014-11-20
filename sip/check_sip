@@ -1,0 +1,260 @@
+#!/usr/bin/perl -w
+
+use strict;
+use diagnostics;
+
+use IO::Socket::INET;
+use Net::DNS;
+use Data::Dumper;
+use Time::HiRes qw /time /;
+use List::Util qw(sum);
+
+use Getopt::Long;
+Getopt::Long::Configure qw(bundling);
+
+my %o = (
+	help			=> 0,
+	verbose			=> 0,
+	timeout			=> 1,
+	localport		=> 5060,
+	localaddress		=> "0.0.0.0",
+	remoteport		=> 5060,
+	maxattempts		=> 5,
+	success			=> 5,
+	sipid			=> "111111",
+	sipdomain		=> "sipgate.de",
+	outboundproxy		=> '',
+	responsecode		=> '200',
+	ignoreresponse		=> 0,
+);
+
+GetOptions(
+	"help|h+"			=> \$o{help},
+	"verbose|v+"			=> \$o{verbose},
+	"timeout|t=i"			=> \$o{timeout},
+	"remoteport|port|p=i"		=> \$o{remoteport},
+	"localport|l=i"			=> \$o{localport},
+	"bindaddress|b=s"		=> \$o{localaddress},
+	"hostname|host|H=s"		=> \$o{hostname},
+	"maxattempts|m=i"		=> \$o{maxattempts},
+	"success|s=i"			=> \$o{success},
+	"sipid|i=s"			=> \$o{sipid},
+	"sipdomain|d=s"			=> \$o{sipdomain},
+	"outboundproxy|o=s"		=> \$o{outboundproxy},
+	"responsecode|r=i"		=> \$o{responsecode},
+	"ignoreresponse"		=> \$o{ignoreresponse},
+
+);
+
+my $EXIT = "UNKNOWN";
+my %ERRORS      = ('OK'=>0,'WARNING'=>1,'CRITICAL'=>2,'UNKNOWN'=>3,'DEPENDENT'=>4);
+
+my %CRY		= (
+	recv		=> "recv failed\n",
+	send		=> "send failed\n",
+	timeout		=> "timeout\n",
+);
+
+exit $ERRORS{$EXIT} unless (defined $o{hostname} || $o{sipdomain});
+$o{hostname} = $o{sipdomain} if (!defined($o{hostname}));
+$o{sipdomain} = $o{hostname} if (!defined($o{sipdomain}));
+$o{success} = $o{maxattempts} if $o{success} > $o{maxattempts};
+
+my @hosts_to_check;
+
+print "Examining Host $o{hostname}...\n" if $o{verbose};
+
+if ($o{hostname} =~ /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$/) {
+	print "Found IP in host declaration, adding $o{hostname} to Array\n" if $o{verbose};
+	push @hosts_to_check, $o{hostname};
+} else {
+	print "Gotta resolve $o{hostname} first before checking\n" if $o{verbose};
+	# do dns lookup (first srv, then A)
+	my $res = Net::DNS::Resolver->new;
+	my $srvquery = $res->query('_sip._udp.'.$o{hostname},'SRV');
+	if ($srvquery) {
+		foreach my $rr ($srvquery->answer) {
+			my $proxy = $rr->target;
+			if ($proxy =~ /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$/) {
+				push @hosts_to_check, $proxy;
+			} else {
+				my $aquery = $res->search($proxy);
+				if ($aquery) {
+					foreach my $ra ($aquery->answer) {
+						next unless $ra->type eq "A";
+						push @hosts_to_check, $ra->address;
+					}
+				} else {
+					print "Could not resolve Host $proxy: $res->errorstring\n" if $o{verbose};
+				}
+			}
+		}
+	} else {
+		print "Did not find SRV records for $o{hostname}: $res->errorstring\n" if $o{verbose};
+		my $aquery = $res->search($o{hostname});
+		if ($aquery) {
+			foreach my $ra ($aquery->answer) {
+				next unless $ra->type eq "A";
+				push @hosts_to_check, $ra->address;
+			}
+		} else {
+			print "Could not resolve Host $o{hostname}: $res->errorstring\n" if $o{verbose};
+		}
+	}
+}
+
+print "Checking the following IP addresses:\n" if $o{verbose};
+print Dumper \@hosts_to_check if $o{verbose};
+
+if ($#hosts_to_check == -1) {
+	print "Don't know which hosts to check.";
+	exit $ERRORS{$EXIT};
+}
+
+my %responses = (
+	'online' => [],
+	'shaky' => [],
+	'offline' => [],
+	'failed' => [],
+	'unknown' => []
+);
+my $details = '';
+my $performancedata = '';
+my @responsetimeavg = ();
+
+foreach my $host_to_check (@hosts_to_check) {
+
+	my $resp;
+	my ($tries, $success, $timedout, $failed) = (0, 0, 0, 0);
+	my @responsetimes = ();
+	my @responsecodes;
+	my $callerid = sprintf("%s_%s_nagios_callerid", $$, $o{localport});
+	my $proxy = ($o{outboundproxy} ne '') ? $o{outboundproxy} : $host_to_check;
+	$SIG{ALRM} = sub { die $CRY{timeout}; };
+
+	TRY: {
+
+		while ($tries++ < $o{maxattempts}) {
+
+			my $ftag = '';
+			my $btag = 'z9hG4bK';
+			for (1..10) {
+				$ftag .= chr(97 + int(rand(26)));
+				$btag .= chr(97 + int(rand(26)));
+			}
+
+			my $probe = <<_REQUEST_;
+OPTIONS sip:$host_to_check SIP/2.0\r
+Via: SIP/2.0/UDP $o{localaddress}:$o{localport};rport;branch=$btag\r
+From: <sip:monitor\@nagios.sipgate.net:$o{localport}>;tag=$ftag\r
+To: <sip:$host_to_check>\r
+Call-ID: $callerid\@nagios.sipgate.net\r
+CSeq: 1 OPTIONS\r
+Contact: <sip:monitor\@nagios.sipgate.net:$o{localport}>\r
+Content-Length: 0\r
+Max-Forwards: 70\r
+User-Agent: sipgate monitoring v0.4\r
+Accept: text/plain\r
+\r
+_REQUEST_
+
+			print STDERR "... creating socket\n" if $o{verbose} > 1;
+			my $sock = IO::Socket::INET->new(
+				PeerPort	=> $o{remoteport},
+				PeerAddr	=> $proxy,
+				Proto		=> "udp",
+				LocalPort	=> $o{localport},
+				LocalAddr	=> $o{localaddress},
+				Timeout		=> $o{timeout},
+			);
+
+			unless ($sock) {
+				$o{localport}++;
+				next;
+			}
+
+			alarm $o{timeout};
+			eval {
+				print STDERR "... sending\n" if $o{verbose} > 1;
+				defined $sock->send($probe) or die $CRY{send};
+				print STDERR "... receiving\n" if $o{verbose} > 1;
+				my $sendtime = time;
+				$resp = undef;
+				while (1) {
+					$sock->recv($resp, 1500);
+					if ($resp) {
+						print "Packet received:\n".$resp."\n" if ($o{verbose} > 1);
+						if ($resp =~ /^SIP\/2\.0 (1\d\d)/) {
+							next;
+						}
+						push @responsetimes, (time - $sendtime);
+						printf ("... Time: %.5f\n", $responsetimes[$tries-1]) if ($o{verbose} > 1);
+						last;
+					}
+				}
+				print STDERR "SUCCESS\n" if $o{verbose};
+				chomp($resp);
+			};
+			alarm(0);
+			if ($@) {
+				print STDERR "$@" if $o{verbose};
+				if (index($@, $CRY{timeout}) + 1) {
+					$timedout++;
+					push @responsetimes, $o{timeout};
+				}
+			}
+			print STDERR "... closing socket\n" if $o{verbose} > 1;
+			$sock->close();
+			# Check whether response code matches
+			print "Response: \n".$resp."\n" if ($o{verbose} > 1);
+			$resp =~ /^SIP\/2\.0 (\d\d\d)/;
+			push @responsecodes, $1 if ($1);
+			if ($1 && ($o{ignoreresponse} || $1 == $o{responsecode})) {
+				$success++;
+			} else {
+				$failed++;
+			}
+		}
+	}
+
+	$tries--;
+	$details .= sprintf("Host %s: %d of %d %s succeeded. Response: %s\n",$host_to_check, $success, $tries, ($tries == 1) ? 'try' : 'tries', join(',',@responsecodes));
+	if ($success >= $o{success}) {
+		push @{$responses{'online'}}, $host_to_check;
+	} elsif ($success > 0) {
+		push @{$responses{'shaky'}}, $host_to_check;
+	} elsif ($timedout) {
+		push @{$responses{'offline'}}, $host_to_check;
+	} elsif ($failed) {
+		push @{$responses{'failed'}}, $host_to_check;
+	} else {
+		push @{$responses{'unknown'}}, $host_to_check;
+	}
+	# add average response time to array
+	push @responsetimeavg, sprintf("%.5f",(sum(@responsetimes)/@responsetimes));
+}
+printf ("Checked %d peer%s", scalar(@hosts_to_check), (scalar(@hosts_to_check) == 1) ? '' : 's');
+if (scalar(@hosts_to_check) == scalar(@{$responses{'online'}})) {
+	printf(", %d peer%s online", scalar(@{$responses{'online'}}), (scalar(@{$responses{'online'}}) == 1) ? '' : 's');
+} else {
+	my %failurecases = ('shaky' => 'shaky', 'offline' => 'offline', 'failed' => 'with wrong result', 'unknown' => 'unknown');
+	foreach my $key (keys %failurecases) {
+		if (scalar(@{$responses{$key}}) > 0) {
+			printf (", %d peer%s %s", scalar(@{$responses{$key}}), (scalar(@{$responses{$key}}) == 1) ? '' : 's', $failurecases{$key});
+		}
+	}
+}
+printf ("|AvgResp=%s\n",join(',',@responsetimeavg));
+print $details;
+
+if (scalar(@hosts_to_check) == scalar(@{$responses{'online'}})) {
+	$EXIT = 'OK';
+} elsif (scalar(@{$responses{'offline'}}) > 0 || scalar(@{$responses{'failed'}}) > 0) {
+	$EXIT = 'CRITICAL';
+} elsif (scalar(@{$responses{'shaky'}}) > 0 ) {
+	$EXIT = 'WARNING';
+} else {
+	$EXIT = 'UNKNOWN';
+}
+
+exit $ERRORS{$EXIT};
